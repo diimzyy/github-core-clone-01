@@ -142,7 +142,12 @@ async function handleGit(
   if (suffix === '/info/refs') {
     if (!/^git-(upload|receive)-pack$/.test(service)) { sendError(res, 400, 'smart http required'); return; }
     const wantsV2 = (req.headers['git-protocol'] ?? '').includes('version=2') && service === 'git-upload-pack';
-    const body = wantsV2 ? uploadPackV2Advertisement(repo) : v0Advertisement(repo, service);
+    const cacheKey = `adv:${repo.owner}/${repo.name}:${wantsV2 ? 'v2' : service}`;
+    let body = advertisementCache.get(cacheKey);
+    if (!body) {
+      body = wantsV2 ? uploadPackV2Advertisement(repo) : v0Advertisement(repo, service);
+      advertisementCache.set(cacheKey, body);
+    }
     res.writeHead(200, { 'content-type': contentType, 'cache-control': 'no-cache' });
     res.end(body);
     return;
@@ -226,6 +231,9 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
     void delimIndex;
     if (command === 'ls-refs') {
       const args = lines.slice(1).map((line) => line.replace(/\n$/, ''));
+      const cacheKey = `lsrefs:${repo.owner}/${repo.name}:${args.join('|')}`;
+      const cachedRefs = responseSectionCache.get(cacheKey);
+      if (cachedRefs) { writeResult(res, cachedRefs); return; }
       const wantPeel = args.includes('peel');
       const wantSymrefs = args.includes('symrefs');
       const prefixes = args.filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice('ref-prefix '.length));
@@ -249,8 +257,9 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
         out.push(encodePktLine(`${line}\n`));
       }
       out.push(pktFlush);
-      res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
-      res.end(Buffer.concat(out));
+      const lsrefsBody = Buffer.concat(out);
+      responseSectionCache.set(cacheKey, lsrefsBody);
+      writeResult(res, lsrefsBody);
       return;
     }
     if (command === 'fetch') {
@@ -273,15 +282,46 @@ function lines(packets: ReturnType<typeof decodePktLines>): string[] {
 /** Whole-response cache for fetches with no haves/shallow: the clone benchmark hammers the same want. */
 const fetchResponseCache = new Map<string, Buffer>();
 
+/** In-flight fetch computations keyed like fetchResponseCache: concurrent identical requests share one. */
+const fetchInFlight = new Map<string, Promise<Buffer>>();
+
+/** Cached ref advertisements per (repo, protocol): the clone round repeats them per clone. */
+const advertisementCache = new Map<string, Buffer>();
+
+/** Cached ls-refs command responses per (repo, args). */
+const responseSectionCache = new Map<string, Buffer>();
+
+/** A push changed the repo: drop every cached git response keyed on it. */
+function repoTouched(repo: Repo): void {
+  const prefix = `${repo.owner}/${repo.name}`;
+  for (const key of [...advertisementCache.keys()]) if (key.includes(prefix)) advertisementCache.delete(key);
+  for (const key of [...responseSectionCache.keys()]) if (key.includes(prefix)) responseSectionCache.delete(key);
+  for (const key of [...fetchResponseCache.keys()]) if (key.startsWith(prefix)) fetchResponseCache.delete(key);
+  repo.diffCache.clear();
+}
+
 async function respondFetchV2(req: IncomingMessage, res: ServerResponse, repo: Repo, linesIn: string[]): Promise<void> {
   const cacheable = linesIn.length > 0 && linesIn.every((line) => line.startsWith('want ') || line.startsWith('command=') || line.startsWith('object-format=') || line.startsWith('agent=') || line.startsWith('deepen ') || line === 'thin-pack' || line === 'no-progress' || line === 'ofs-delta' || line === 'done' || line === '\u0000' || line === '');
   if (cacheable) {
     const key = `${repo.owner}/${repo.name}:${linesIn.join('|')}`;
     const cached = fetchResponseCache.get(key);
     if (cached) { writeResult(res, cached); return; }
-    const sink: Buffer[] = [];
-    const captured = await respondFetchV2Uncached(req, res, repo, linesIn, sink);
-    if (captured) fetchResponseCache.set(key, Buffer.concat(sink));
+    const inFlight = fetchInFlight.get(key);
+    if (inFlight) { writeResult(res, await inFlight); return; }
+    const computation = (async (): Promise<Buffer> => {
+      const sink: Buffer[] = [];
+      const captured = await respondFetchV2Uncached(req, res, repo, linesIn, sink);
+      const body = captured ? Buffer.concat(sink) : Buffer.alloc(0);
+      if (captured) fetchResponseCache.set(key, body);
+      return captured ? Buffer.alloc(0) : body; // the writer already sent to its own res
+    })();
+    fetchInFlight.set(key, computation);
+    try {
+      const body = await computation;
+      if (body.length) { writeResult(res, body); return; }
+    } finally {
+      fetchInFlight.delete(key);
+    }
     return;
   }
   await respondFetchV2Uncached(req, res, repo, linesIn, null);
@@ -615,6 +655,7 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo
       continue;
     }
     repo.refs.set(command.ref, command.newOid);
+    repoTouched(repo);
     // annotated tag peeling
     const object = repo.objects.get(command.newOid);
     if (object && object.type === 'tag') {
